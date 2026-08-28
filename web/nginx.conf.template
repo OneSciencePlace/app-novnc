@@ -1,0 +1,110 @@
+# nginx.conf.template - per-session token gate for apps with no native
+# URL-token auth. Rendered by web/token-gate.sh with envsubst; ${OSP_APP_PORT},
+# ${OSP_APP_TOKEN}, ${OSP_APP_TOKEN_NAME}, ${OSP_APP_UPSTREAM_PORT} and ${NGINX_DIR} are
+# substituted, every other $variable is nginx's own.
+#
+# Runs entirely unprivileged: no `user` directive (that one needs root), a
+# listen port >= 1024, and every writable path under ${NGINX_DIR} (/tmp),
+# because the .sif filesystem is read-only.
+
+worker_processes  1;
+daemon            off;
+pid               ${NGINX_DIR}/nginx.pid;
+error_log         ${NGINX_DIR}/error.log warn;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    # The default `combined` format logs $request, which includes the query
+    # string -- and the first request of every session carries the token in it.
+    # Log the path only, so the secret is never written to disk.
+    log_format gated '$remote_addr [$time_local] '
+                     '"$request_method $uri $server_protocol" '
+                     '$status $body_bytes_sent';
+    access_log            ${NGINX_DIR}/access.log gated;
+    client_body_temp_path ${NGINX_DIR}/body;
+    proxy_temp_path       ${NGINX_DIR}/proxy;
+    fastcgi_temp_path     ${NGINX_DIR}/fastcgi;
+    uwsgi_temp_path       ${NGINX_DIR}/uwsgi;
+    scgi_temp_path        ${NGINX_DIR}/scgi;
+
+    sendfile             on;
+    client_max_body_size 0;      # data files move through here; don't cap them
+
+    # WebSocket upgrade plumbing. noVNC, JupyterLab terminals and RStudio all
+    # depend on this; without it the page loads and then silently does nothing.
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    # --- the gate ----------------------------------------------------------
+    # Two ways in: the token as a query parameter (the link Satellite hands the
+    # user) or the cookie we set in exchange for it on that first request.
+    map $arg_${OSP_APP_TOKEN_NAME} $token_in_query {
+        '${OSP_APP_TOKEN}' 1;
+        default        0;
+    }
+    map $cookie_${OSP_APP_TOKEN_NAME} $token_in_cookie {
+        '${OSP_APP_TOKEN}' 1;
+        default        0;
+    }
+    map "$token_in_query:$token_in_cookie" $gate {
+        '1:0'   exchange;    # valid token in the URL, no cookie yet
+        '1:1'   pass;
+        '0:1'   pass;
+        default deny;
+    }
+
+    server {
+        listen       ${OSP_APP_PORT} default_server;
+        server_name  _;
+        default_type text/plain;    # only affects pages nginx itself returns
+
+        # Satellite speaks https to the browser and http to us. Left on,
+        # nginx would build redirects as http://<host>:<port>/ from OUR
+        # scheme and port and send the browser somewhere that does not exist.
+        # Relative Location headers resolve against the browser's origin.
+        absolute_redirect off;
+
+        # Satellite terminates TLS and proxies plain HTTP to us over the
+        # trusted cluster network. Apps that build their own absolute URLs or
+        # websocket endpoints need to be told the browser is speaking https.
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        location / {
+            # Trade the query-string token for a cookie, then redirect to the
+            # same path without it -- so the secret stops travelling in URLs,
+            # browser history and Referer headers after the first hop.
+            if ($gate = exchange) {
+                add_header Set-Cookie "${OSP_APP_TOKEN_NAME}=${OSP_APP_TOKEN}; Path=/; HttpOnly; SameSite=Lax; Secure" always;
+                return 302 $uri;
+            }
+
+            if ($gate = deny) {
+                return 403 "403 Forbidden - append ?${OSP_APP_TOKEN_NAME}=<session token> to this URL\n";
+            }
+
+            proxy_pass http://127.0.0.1:${OSP_APP_UPSTREAM_PORT};
+
+            proxy_http_version 1.1;
+            proxy_set_header   Upgrade    $http_upgrade;
+            proxy_set_header   Connection $connection_upgrade;
+
+            # Interactive sessions are long-lived and stream; don't buffer them
+            # and don't time the websocket out after the default 60s.
+            proxy_buffering    off;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+    }
+}
