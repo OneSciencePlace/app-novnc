@@ -41,6 +41,14 @@ http {
 
     sendfile             on;
     server_tokens        off;    # no nginx version on error pages
+
+    # The session token is a key in the gate's maps below, and a key must fit
+    # in one hash bucket. nginx sizes buckets from the CPU's cache line (often
+    # 64 bytes), which a 64-character token does not fit ("could not build
+    # map_hash"). 256 holds any token session-env.sh accepts (at most 200
+    # characters). It must come before the first map block.
+    map_hash_bucket_size 256;
+
     client_max_body_size 0;      # data files move through here; don't cap them
 
     # WebSocket upgrade plumbing. noVNC, JupyterLab terminals and RStudio all

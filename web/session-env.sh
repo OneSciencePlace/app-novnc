@@ -69,6 +69,8 @@ fi
 case "$OSP_APP_TOKEN" in
     *[!A-Za-z0-9._~-]*) echo "[session] OSP_APP_TOKEN must match [A-Za-z0-9._~-]+" >&2; exit 1 ;;
 esac
+# ...and at most 200 characters, so it fits the gate's map_hash_bucket_size.
+[ "${#OSP_APP_TOKEN}" -le 200 ] || { echo "[session] OSP_APP_TOKEN is longer than 200 characters" >&2; exit 1; }
 
 # The session's private directory. Always created fresh under /tmp, never
 # taken from the environment and never under $TMPDIR: $TMPDIR is the job
