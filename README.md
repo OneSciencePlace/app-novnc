@@ -35,9 +35,9 @@ docker run --rm --user "$(id -u):$(id -g)" \
   -e OSP_APP_PORT=6080 -e OSP_APP_BIND=0.0.0.0 -e OSP_APP_TOKEN \
   ghcr.io/onescienceplace/app-novnc:latest
 
-# Apptainer, under the OSP interactive run profile (osp-run-profiles/).
+# Apptainer, under the OSP interactive run profile.
 # APPTAINERENV_<NAME> reaches the container as <NAME>, even with --cleanenv.
-apptainer pull oras://ghcr.io/onescienceplace/app-novnc-sif:latest
+apptainer pull oras://ghcr.io/onescienceplace/app-novnc-sif:latest   # production pins <version>@sha256:<digest>
 export APPTAINERENV_OSP_APP_TOKEN="$OSP_APP_TOKEN"
 apptainer run \
   --contain --pid --ipc --cleanenv --no-mount bind-paths,cwd \
@@ -46,7 +46,7 @@ apptainer run \
   app-novnc-sif_latest.sif
 ```
 
-Through OSP, open `https://<session>.<satellite-domain>/?token=<token>`.
+Through OSP, open `https://<session-label>.<sat-id>.sat.<domain>/?token=<token>`.
 Locally, `http://localhost:6080/?token=$OSP_APP_TOKEN` (Docker), or forward the
 port first for Apptainer on a cluster node: `ssh -L 6080:127.0.0.1:6080 <node>`.
 
@@ -183,8 +183,8 @@ IP: the gate's cookie is marked `Secure`, and browsers make an exception for
 dropped and every page load needs `?token=` again. Over localhost the whole
 flow — cookie exchange, redirect, websocket — behaves as it will in production.
 
-To check isolation between two sessions of the same user on one node, use
-`tools/two-session-check.sh` in `osp-run-profiles/`.
+Isolation between two sessions of the same account is checked per system,
+before interactive apps are offered there (OSP's internal validation procedure).
 
 ### Why `--user`
 
