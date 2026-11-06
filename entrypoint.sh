@@ -58,14 +58,34 @@ XDG_RUNTIME_DIR="$OSP_APP_SOCK_DIR/run"
 mkdir -p "$XDG_RUNTIME_DIR"
 export XDG_RUNTIME_DIR
 
+# The image's ENV points HOME and XDG_CACHE_HOME at fixed paths in /tmp. With
+# the run profile /tmp is the session's own, and Apptainer normally sets the
+# real HOME, so there they are harmless. On a node-shared /tmp they belong to
+# whichever user ran first, and every later user's writes there fail. Keep
+# them only if the job set its own.
+if [ "${HOME:-/tmp}" = /tmp ]; then
+    HOME="$OSP_APP_SOCK_DIR/home"
+    mkdir -p "$HOME"
+fi
+if [ -z "${XDG_CACHE_HOME:-}" ] || [ "$XDG_CACHE_HOME" = /tmp/.cache ]; then
+    XDG_CACHE_HOME="$OSP_APP_SOCK_DIR/cache"
+fi
+export HOME XDG_CACHE_HOME
+
 # X only creates /tmp/.X11-unix when it is running as root, which we never
 # are. Under Docker the Dockerfile pre-creates it; under Apptainer /tmp is the
 # session's own (with the run profile) or the node's (without), and this is
 # the line that matters. 1777 explicitly: umask 077 would otherwise make it
 # 0700, and on a node-shared /tmp that would lock every other user's X server
 # out of it.
-# shellcheck disable=SC2174  # /tmp always exists; -m is for .X11-unix itself
-mkdir -p -m 1777 /tmp/.X11-unix 2>/dev/null || true
+[ -d /tmp/.X11-unix ] || mkdir -m 1777 /tmp/.X11-unix 2>/dev/null || true
+# If another user made it with a narrower mode, every display would fail and
+# the walk below would end in a misleading "no free X display". Say why now.
+if [ ! -w /tmp/.X11-unix ]; then
+    echo "[novnc] /tmp/.X11-unix is not writable for uid $(id -u); the X server cannot start." >&2
+    ls -ld /tmp/.X11-unix >&2 2>/dev/null || true
+    exit 1
+fi
 
 # The MIT-MAGIC-COOKIE, in the session directory (0600 under umask 077).
 XAUTHORITY="$OSP_APP_SOCK_DIR/Xauthority"

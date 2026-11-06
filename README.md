@@ -126,7 +126,15 @@ the token exchange. So the image bakes an `index.html` that redirects to
 **`/tmp/.X11-unix`.** X only creates it when running as root, which we never
 are. The Dockerfile pre-creates it for the Docker case; the entrypoint creates
 it for the Apptainer case, explicitly mode `1777` so that on a node-shared
-`/tmp` it never locks other users out.
+`/tmp` it never locks other users out. If it already exists and is not
+writable for us, the entrypoint stops and says so rather than walking every
+display number to a misleading "no free X display".
+
+**`HOME` and `XDG_CACHE_HOME`.** The image defaults them to `/tmp` and
+`/tmp/.cache`. Where those are still in effect, the entrypoint moves them into
+the session directory, because on a node-shared `/tmp` they would belong to
+whichever user ran first. A value the job sets itself — including the real
+`HOME` Apptainer normally provides — is kept.
 
 **Websockets.** The gate sets `proxy_http_version 1.1` plus the
 `Upgrade`/`Connection` pair and an 86400s read timeout. Without those the noVNC
