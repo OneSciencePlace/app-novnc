@@ -21,9 +21,12 @@
 #   * Each launch is checked: the recorded pid must lead its own process group
 #     and be running the expected program, not a wrapper that has already
 #     handed off and exited.
-#   * The session ends as soon as any `critical` or `leader` service exits.
-#     wait -n sleeps until that happens; nothing polls. A `leader` exiting
-#     with status 0 is a normal log-out (exit 0); anything else exits 1.
+#   * The session ends as soon as any `critical` or `leader` service exits,
+#     including one that died before supervision began: each round first
+#     checks that every watched service is alive, then `wait -n` sleeps until
+#     a child exits (a SIGCHLD trap also wakes it). Nothing polls on a timer.
+#     A `leader` exiting with status 0 is a normal log-out (exit 0); anything
+#     else exits 1.
 #   * Cleanup runs on every exit path (EXIT trap, installed here, before the
 #     first service starts): TERM to every group in reverse start order, the
 #     first-registered service (the X server) last so applications are not
@@ -163,7 +166,7 @@ _osp_stop_groups() {
 
 _osp_cleanup() {
     local rc=$? i pg rest=()
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM CHLD
     set +e
     if [ "${#_osp_order[@]}" -gt 0 ]; then
         # Everything but the first-registered service, newest first...
@@ -194,15 +197,44 @@ trap 'osp_log "received SIGINT"; exit 130' INT
 
 # Block until a critical or leader service exits, then end the session. The
 # EXIT trap does the stopping.
+#
+# `wait -n` alone is not enough. A service that exits after it is registered
+# but before `wait -n` starts -- while the rest of the session is still
+# starting -- has already been reaped and reported by bash, which then forgets
+# it: `wait -n` answers "no such job" for that pid and waits on the others,
+# and the session would run on without, say, its X server (plan S-8). So each
+# round first checks every watched service with osp_alive (a reaped or zombie
+# process is not alive) and only then waits. A trap on SIGCHLD makes any
+# child's exit end the wait early, so a death between the check and the wait
+# is caught on the next round rather than missed.
 osp_supervise() {
-    local pid="" rc=0 n names=()
+    local pid="" rc=0 n names=() dead
     if [ "${#_osp_watch[@]}" -eq 0 ]; then
         osp_log "no critical services registered"
         exit 1
     fi
     for n in "${_osp_watch[@]}"; do names+=("${_osp_name[$n]}"); done
     osp_log "supervising: ${names[*]} (pid $$)"
-    if wait -n -p pid "${_osp_watch[@]}"; then rc=0; else rc=$?; fi
+    trap ':' CHLD
+    while :; do
+        dead=""
+        for n in "${_osp_watch[@]}"; do
+            osp_alive "$n" || { dead=$n; break; }
+        done
+        if [ -n "$dead" ]; then
+            # bash keeps a reaped child's status for `wait <pid>`.
+            pid=$dead
+            if wait "$pid" 2>/dev/null; then rc=0; else rc=$?; fi
+            break
+        fi
+        pid=""
+        if wait -n -p pid "${_osp_watch[@]}" 2>/dev/null; then rc=0; else rc=$?; fi
+        # A pid means a watched service ended. No pid: another child (a
+        # helper, a log relay) woke the wait, or bash had already forgotten
+        # the job; check again.
+        [ -n "$pid" ] && break
+    done
+    trap - CHLD
     n=${_osp_name[$pid]:-"pid ${pid:-?}"}
     if [ "$rc" -eq 0 ] && [ -n "$pid" ] && [ "$pid" = "$_osp_leader" ]; then
         osp_log "$n exited normally; ending the session"
