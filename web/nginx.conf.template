@@ -1,16 +1,22 @@
 # nginx.conf.template - per-session token gate for apps with no native
 # URL-token auth. Rendered by web/token-gate.sh with envsubst; ${OSP_APP_PORT},
-# ${OSP_APP_TOKEN}, ${OSP_APP_TOKEN_NAME}, ${OSP_APP_UPSTREAM_PORT} and ${NGINX_DIR} are
-# substituted, every other $variable is nginx's own.
+# ${OSP_APP_BIND}, ${OSP_APP_TOKEN}, ${OSP_APP_TOKEN_NAME}, ${OSP_APP_SOCK_DIR},
+# ${OSP_APP_HEALTH_PATH} and ${NGINX_DIR} are substituted, every other
+# $variable is nginx's own.
 #
 # Runs entirely unprivileged: no `user` directive (that one needs root), a
-# listen port >= 1024, and every writable path under ${NGINX_DIR} (/tmp),
-# because the .sif filesystem is read-only.
+# listen port >= 1024, and every writable path under ${NGINX_DIR}, inside the
+# session's private directory, because the .sif filesystem is read-only.
+#
+# This is the only TCP listener in the session. Behind it the app is a Unix
+# socket, ${OSP_APP_SOCK_DIR}/app.sock: a loopback TCP port would be reachable
+# by every other process on the node, token or no token.
 
 worker_processes  1;
 daemon            off;
 pid               ${NGINX_DIR}/nginx.pid;
-error_log         ${NGINX_DIR}/error.log warn;
+# stderr, which the supervisor relays into the job's output with a prefix.
+error_log         stderr warn;
 
 events {
     worker_connections  1024;
@@ -34,6 +40,15 @@ http {
     scgi_temp_path        ${NGINX_DIR}/scgi;
 
     sendfile             on;
+    server_tokens        off;    # no nginx version on error pages
+
+    # The session token is a key in the gate's maps below, and a key must fit
+    # in one hash bucket. nginx sizes buckets from the CPU's cache line (often
+    # 64 bytes), which a 64-character token does not fit ("could not build
+    # map_hash"). 256 holds any token session-env.sh accepts (at most 200
+    # characters). It must come before the first map block.
+    map_hash_bucket_size 256;
+
     client_max_body_size 0;      # data files move through here; don't cap them
 
     # WebSocket upgrade plumbing. noVNC, JupyterLab terminals and RStudio all
@@ -61,8 +76,15 @@ http {
         default deny;
     }
 
+    # The app, on a Unix socket in the session's private directory.
+    upstream osp_app {
+        server unix:${OSP_APP_SOCK_DIR}/app.sock;
+    }
+
     server {
-        listen       ${OSP_APP_PORT} default_server;
+        # Loopback by default (OSP_APP_BIND): the launcher's reverse SSH
+        # tunnel connects here, and nothing else needs to.
+        listen       ${OSP_APP_BIND}:${OSP_APP_PORT} default_server;
         server_name  _;
         default_type text/plain;    # only affects pages nginx itself returns
 
@@ -72,14 +94,29 @@ http {
         # Relative Location headers resolve against the browser's origin.
         absolute_redirect off;
 
-        # Satellite terminates TLS and proxies plain HTTP to us over the
-        # trusted cluster network. Apps that build their own absolute URLs or
-        # websocket endpoints need to be told the browser is speaking https.
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-Host  $host;
+        # Readiness, for the launcher: "ok" with 200 once the app answers 2xx
+        # for OSP_APP_HEALTH_PATH on its socket, 503 before that. Ungated, so
+        # the app's own response never reaches the caller: auth_request makes
+        # the upstream request as a subrequest and keeps only its status, and
+        # the 200 body is a fixed file (a `return` would answer before the
+        # check ran). This says the upstream is serving, not that the desktop
+        # is usable; the supervisor ends the session if any part of it dies.
+        location = /healthz {
+            access_log   off;
+            auth_request /_osp_upstream_ready;
+            error_page   401 403 500 =503 @unhealthy;
+            default_type text/plain;
+            alias        ${NGINX_DIR}/healthz.ok;
+        }
+        location = /_osp_upstream_ready {
+            internal;
+            proxy_pass              http://osp_app/${OSP_APP_HEALTH_PATH};
+            proxy_pass_request_body off;
+            proxy_set_header        Content-Length "";
+        }
+        location @unhealthy {
+            return 503;
+        }
 
         location / {
             # Trade the query-string token for a cookie, then redirect to the
@@ -90,15 +127,29 @@ http {
                 return 302 $uri;
             }
 
+            # A bare 403: nothing that tells the reader how to get in.
             if ($gate = deny) {
-                return 403 "403 Forbidden - append ?${OSP_APP_TOKEN_NAME}=<session token> to this URL\n";
+                return 403;
             }
 
-            proxy_pass http://127.0.0.1:${OSP_APP_UPSTREAM_PORT};
+            proxy_pass http://osp_app;
 
+            # Every proxy_set_header lives here, in one block. nginx inherits
+            # proxy_set_header from an enclosing level ONLY when the current
+            # level defines none, so splitting them between server{} and
+            # location{} silently drops the server-level ones.
+            #
+            # Satellite terminates TLS and proxies plain HTTP to us. Apps that
+            # build their own absolute URLs or websocket endpoints need to be
+            # told the browser is speaking https.
             proxy_http_version 1.1;
-            proxy_set_header   Upgrade    $http_upgrade;
-            proxy_set_header   Connection $connection_upgrade;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto https;
+            proxy_set_header   X-Forwarded-Host  $host;
+            proxy_set_header   Upgrade           $http_upgrade;
+            proxy_set_header   Connection        $connection_upgrade;
 
             # Interactive sessions are long-lived and stream; don't buffer them
             # and don't time the websocket out after the default 60s.

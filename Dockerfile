@@ -4,6 +4,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Xvnc (the X server), noVNC (the browser client), websockify (the bridge
 # between them), a small window manager, and the gate's two dependencies.
+# bash is the entrypoint's shell (web/supervise.sh needs `wait -n`); it is in
+# the base image already and listed so that stays true.
 #
 # feh is not optional scenery: fluxbox's default style carries a `background:`
 # directive, which makes it shell out to fbsetbg, which needs one of feh /
@@ -11,13 +13,31 @@ ENV DEBIAN_FRONTEND=noninteractive
 # pops its complaint up as an xmessage dialog ON THE DESKTOP -- the first
 # thing a user sees through noVNC.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
+        ca-certificates bash \
         tigervnc-standalone-server tigervnc-common xauth \
         novnc websockify \
         fluxbox xterm x11-utils \
         feh \
         nginx-light gettext-base \
     && rm -rf /var/lib/apt/lists/*
+
+# Fail the build, not the session, if a package lacks what the entrypoint and
+# the gate depend on:
+#   - Xvnc must listen for RFB on a Unix socket (rfbunixpath). TigerVNC's help
+#     lists its parameters without the leading dash.
+#   - websockify must listen on a Unix socket (--unix-listen).
+#   - nginx must have auth_request (the gate's /healthz uses it).
+#   - bash must be 5.1+ for `wait -n -p`.
+RUN set -e; \
+    Xvnc -help 2>&1 | grep -q rfbunixpath \
+        || { echo "Xvnc has no rfbunixpath option" >&2; exit 1; }; \
+    websockify --help 2>&1 | grep -q -- '--unix-listen' \
+        || { echo "websockify has no --unix-listen option" >&2; exit 1; }; \
+    nginx -V 2>&1 | grep -q http_auth_request_module \
+        || { echo "nginx lacks http_auth_request_module" >&2; exit 1; }; \
+    bash -c '(( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) ))' \
+        || { echo "bash is older than 5.1" >&2; exit 1; }; \
+    echo "[build] Xvnc, websockify, nginx and bash support what the entrypoint needs"
 
 WORKDIR /app
 
@@ -33,23 +53,24 @@ RUN printf '%s\n' \
 # will not create it itself as a non-root user.
 RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
-# Read-only .sif, unprivileged user: everything writable lives in /tmp.
+# Read-only .sif, unprivileged user: everything writable lives in /tmp or the
+# working directory. XDG_RUNTIME_DIR is not set here: the entrypoint puts it
+# inside the session's private directory.
 ENV HOME=/tmp \
-    XDG_CACHE_HOME=/tmp/.cache \
-    XDG_RUNTIME_DIR=/tmp/run
+    XDG_CACHE_HOME=/tmp/.cache
 
 # Branch B of the interactive contract: VNC has no URL-token auth, so the
-# nginx gate owns OSP_APP_PORT and websockify hides on OSP_APP_UPSTREAM_PORT.
+# nginx gate owns OSP_APP_PORT and websockify sits behind it on a Unix socket.
 # OSP_APP_TOKEN_NAME is deliberately NOT an ENV here. Its value is a parameter
 # name, not a secret, but BuildKit's SecretsUsedInArgOrEnv check matches on
-# the word TOKEN and warns. web/session-env.sh already defaults it to `token`,
-# so the ENV was redundant.
+# the word TOKEN and warns. web/session-env.sh already defaults it to `token`.
+# OSP_APP_BIND defaults to 127.0.0.1 in web/session-env.sh; a local
+# `docker run -p` needs -e OSP_APP_BIND=0.0.0.0.
 ENV OSP_APP_PORT=6080 \
-    OSP_APP_UPSTREAM_PORT=6081 \
     VNC_GEOMETRY=1920x1080
 # VNC_DISPLAY is deliberately unset: entrypoint.sh walks :1, :2, ... for a
-# free one, because display numbers are global to the node. Set it at run
-# time only to demand a specific number.
+# free one, because display numbers are global to the node when /tmp is
+# shared. Set it at run time only to demand a specific number.
 EXPOSE 6080
 
 # /etc/passwd group-writable so entrypoint can add an entry for the runtime uid
@@ -63,6 +84,7 @@ COPY entrypoint.sh /app/entrypoint.sh
 # made under a restrictive umask yields 0600/0700 files that the runtime user --
 # `docker run --user`, or any user at all under Apptainer -- cannot even read.
 # Git only tracks the exec bit, so this is not something the repo can guarantee.
+# supervise.sh is sourced, not executed, so a+r is all it needs.
 RUN chmod -R a+rX /app \
     && chmod 0755 /app/entrypoint.sh /app/web/token-gate.sh /app/web/session-env.sh
 
