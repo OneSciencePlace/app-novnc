@@ -1,3 +1,8 @@
+# The shared session files (web/: the session contract, the token gate, the
+# supervisor) come from app-template's kit image rather than a copy kept in
+# this repo: a fix to them reaches this image by bumping this line.
+FROM ghcr.io/onescienceplace/app-kit:1.1.0@sha256:8be57aac17696826c15692cf256dc69681ecf7b6137021ebeef09e4776118368 AS kit
+
 FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -21,23 +26,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         nginx-light gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
-# Fail the build, not the session, if a package lacks what the entrypoint and
-# the gate depend on:
+# Fail the build, not the session, if a package lacks what the entrypoint
+# depends on (what the gate and the supervisor need is checked by the kit's
+# check-deps.sh, once web/ is in place below):
 #   - Xvnc must listen for RFB on a Unix socket (rfbunixpath). TigerVNC's help
 #     lists its parameters without the leading dash.
 #   - websockify must listen on a Unix socket (--unix-listen).
-#   - nginx must have auth_request (the gate's /healthz uses it).
-#   - bash must be 5.1+ for `wait -n -p`.
 RUN set -e; \
     Xvnc -help 2>&1 | grep -q rfbunixpath \
         || { echo "Xvnc has no rfbunixpath option" >&2; exit 1; }; \
     websockify --help 2>&1 | grep -q -- '--unix-listen' \
         || { echo "websockify has no --unix-listen option" >&2; exit 1; }; \
-    nginx -V 2>&1 | grep -q http_auth_request_module \
-        || { echo "nginx lacks http_auth_request_module" >&2; exit 1; }; \
-    bash -c '(( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) ))' \
-        || { echo "bash is older than 5.1" >&2; exit 1; }; \
-    echo "[build] Xvnc, websockify, nginx and bash support what the entrypoint needs"
+    echo "[build] Xvnc and websockify support what the entrypoint needs"
 
 WORKDIR /app
 
@@ -78,15 +78,15 @@ EXPOSE 6080
 # Apptainer, which supplies the entry itself.
 RUN chmod g=u /etc/passwd /etc/group
 
-COPY web/ /app/web/
+COPY --from=kit /app/web/ /app/web/
+RUN /app/web/check-deps.sh
 COPY entrypoint.sh /app/entrypoint.sh
 # Explicit modes. COPY preserves the build context's permissions, so a checkout
 # made under a restrictive umask yields 0600/0700 files that the runtime user --
 # `docker run --user`, or any user at all under Apptainer -- cannot even read.
 # Git only tracks the exec bit, so this is not something the repo can guarantee.
-# supervise.sh is sourced, not executed, so a+r is all it needs.
-RUN chmod -R a+rX /app \
-    && chmod 0755 /app/entrypoint.sh /app/web/token-gate.sh /app/web/session-env.sh
+# The kit's files arrive with their modes set.
+RUN chmod -R a+rX /app && chmod 0755 /app/entrypoint.sh
 
 # /data is a mount point. Make it writable by whoever runs the container, so a
 # run without a bind mount still works for a non-root user.

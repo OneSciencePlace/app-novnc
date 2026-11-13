@@ -58,19 +58,12 @@ XDG_RUNTIME_DIR="$OSP_APP_SOCK_DIR/run"
 mkdir -p "$XDG_RUNTIME_DIR"
 export XDG_RUNTIME_DIR
 
-# The image's ENV points HOME and XDG_CACHE_HOME at fixed paths in /tmp. With
-# the run profile /tmp is the session's own, and Apptainer normally sets the
-# real HOME, so there they are harmless. On a node-shared /tmp they belong to
-# whichever user ran first, and every later user's writes there fail. Keep
-# them only if the job set its own.
-if [ "${HOME:-/tmp}" = /tmp ]; then
-    HOME="$OSP_APP_SOCK_DIR/home"
-    mkdir -p "$HOME"
-fi
-if [ -z "${XDG_CACHE_HOME:-}" ] || [ "$XDG_CACHE_HOME" = /tmp/.cache ]; then
-    XDG_CACHE_HOME="$OSP_APP_SOCK_DIR/cache"
-fi
-export HOME XDG_CACHE_HOME
+# HOME and XDG_CACHE_HOME: web/session-env.sh has already moved them off the
+# image's /tmp defaults, per session.
+
+# Every service below starts without OSP_APP_TOKEN in its environment
+# (env -u): only the gate needs it, so the desktop, its terminal and anything
+# the user runs never hold it.
 
 # X only creates /tmp/.X11-unix when it is running as root, which we never
 # are. Under Docker the Dockerfile pre-creates it; under Apptainer /tmp is the
@@ -111,7 +104,7 @@ try_display() {
     xauth -f "$XAUTHORITY" add "$d" . "$XAUTH_COOKIE" 2>/dev/null || return 1
     rm -f "$VNC_SOCK"
 
-    osp_start Xvnc -- Xvnc "$d" \
+    osp_start Xvnc -- env -u OSP_APP_TOKEN Xvnc "$d" \
         -rfbunixpath "$VNC_SOCK" -rfbunixmode 0600 \
         -rfbport -1 \
         -nolisten tcp -nolisten local \
@@ -168,12 +161,19 @@ echo "[novnc] Xvnc ready on $VNC_DISPLAY (rfb unix:$VNC_SOCK)"
 # app-* on this same skeleton -- see the README. Its own chatter (on a fresh
 # home it lists every default it fills in, about 150 lines, every session under
 # the run profile) goes to a file in the session directory, not the job log.
-osp_spawn leader fluxbox fluxbox -- fluxbox -log "$OSP_APP_SOCK_DIR/fluxbox.log"
-osp_spawn helper xterm   xterm   -- xterm -geometry 100x30+80+60
+osp_spawn leader fluxbox fluxbox -- env -u OSP_APP_TOKEN fluxbox -log "$OSP_APP_SOCK_DIR/fluxbox.log"
+osp_spawn helper xterm   xterm   -- env -u OSP_APP_TOKEN xterm -geometry 100x30+80+60
 
 # websockify serves the noVNC client AND bridges the websocket to Xvnc, Unix
 # socket to Unix socket. Everything the browser fetches comes through the gate.
-osp_spawn critical websockify websockify -- websockify \
+#
+# Its TMPDIR is the session directory, not the job directory: websockify is
+# Python and uses multiprocessing, whose default start method since Python
+# 3.14 is a "forkserver" listening on a Unix socket in Python's temporary
+# directory -- which follows TMPDIR, the job directory on shared storage under
+# the run profile (plan NEW-17). websockify keeps no bulk data, so nothing is
+# lost by keeping its temporary files in the private /tmp.
+osp_spawn critical websockify websockify -- env -u OSP_APP_TOKEN TMPDIR="$OSP_APP_SOCK_DIR" websockify \
     --web=/usr/share/novnc \
     --unix-listen="$APP_SOCK" --unix-listen-mode=0600 \
     --unix-target="$VNC_SOCK"

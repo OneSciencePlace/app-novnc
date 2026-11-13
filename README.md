@@ -86,7 +86,10 @@ under `/tmp`, never under `$TMPDIR`: under the run profile `/tmp` is private to
 the session, while `$TMPDIR` is the job directory on shared storage. The
 rendered `nginx.conf` (which holds the token), the X cookie, the sockets and
 `XDG_RUNTIME_DIR` all live there, and the directory is removed when the
-session ends.
+session ends. websockify's own temporary files go there too (`TMPDIR` for it
+only): it is Python, and since Python 3.14 its multiprocessing starts a
+"forkserver" that listens on a Unix socket in the temporary directory, which
+must not be the job directory.
 
 **No VNC password, deliberately.** Xvnc runs `-SecurityTypes None`. There is
 no socket anyone outside the session can reach, and a password file would be
@@ -104,8 +107,10 @@ started too. The session ends when Xvnc, fluxbox, websockify or the gate exits:
 | any of the four died or was killed | `1` |
 | the job was cancelled / `docker stop` (SIGTERM) | `143` |
 
-Cleanup stops everything in reverse start order, Xvnc last, then removes the
-session directory. Service output reaches the job's stderr with a `[name] `
+Every service except the gate starts without `OSP_APP_TOKEN` in its
+environment, so the desktop, its terminal and whatever the user runs never
+hold the token. Cleanup stops everything in reverse start order, Xvnc last,
+then removes the session directory. Service output reaches the job's stderr with a `[name] `
 prefix; fluxbox's own chatter goes to `fluxbox.log` in the session directory.
 
 **Readiness.** `GET /healthz` is ungated and returns `ok` (200) once websockify
@@ -168,7 +173,9 @@ long-lived binary directly.
 Skip GitHub and the registry entirely:
 
 ```bash
-bash -n entrypoint.sh web/supervise.sh       # syntax, before anything else
+bash -n entrypoint.sh                        # syntax, before anything else
+# web/ is not in this repository: the build copies it from the kit image named
+# at the top of the Dockerfile (ghcr.io/onescienceplace/app-kit).
 docker build -t app-novnc:dev .              # --platform linux/amd64 on Apple Silicon
 docker run --rm --user "$(id -u):$(id -g)" \
   -p 127.0.0.1:6080:6080 -v "$PWD:/data" \
